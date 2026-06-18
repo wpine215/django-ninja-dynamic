@@ -153,6 +153,13 @@ class OpenAPISchema(dict):
         for model in operation.models:
             if model.__ninja_param_source__ not in BODY_CONTENT_TYPES:
                 result.extend(self._extract_parameters(model))
+        from ninja.dynamic.decorator import (
+            get_dynamic_openapi_parameters,
+            get_dynamic_state,
+        )
+
+        if get_dynamic_state(operation) is not None:
+            result.extend(get_dynamic_openapi_parameters(operation))
         return result
 
     def _extract_parameters(self, model: TModel) -> List[DictStrAny]:

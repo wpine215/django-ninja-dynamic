@@ -1,6 +1,13 @@
-"""Django Ninja - Fast Django REST framework"""
+"""
+django-ninja-dynamic — Django Ninja fork with per-request dynamic response schemas.
 
-__version__ = "1.6.2"
+Drop-in replacement for django-ninja. Adds opt-in ``?fields=``, ``?omit=``,
+``?include=``, and ``?expand=`` query-parameter support via the
+``@dynamic_response`` decorator and the ``DynamicSchema`` base class. See
+``ninja.dynamic`` for details.
+"""
+
+__version__ = "1.6.2.dev0+dynamic.1"
 
 from pydantic import Field
 
@@ -31,6 +38,15 @@ from ninja.responses import Status
 from ninja.router import Router
 from ninja.schema import Schema
 from ninja.streaming import JSONL, SSE
+
+# Dynamic-schema fork additions:
+from ninja.dynamic import (  # noqa: E402
+    DynamicConfig,
+    DynamicSchema,
+    Expandable,
+    Includable,
+    dynamic_response,
+)
 
 __all__ = [
     "Field",
@@ -63,4 +79,9 @@ __all__ = [
     "SSE",
     "JSONL",
     "Status",
+    "DynamicConfig",
+    "DynamicSchema",
+    "Expandable",
+    "Includable",
+    "dynamic_response",
 ]
