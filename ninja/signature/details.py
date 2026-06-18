@@ -86,14 +86,19 @@ class ViewSignature:
             func_param = self._get_param_type(name, arg)
             self.params.append(func_param)
 
-        if hasattr(view_func, "_ninja_contribute_args"):
-            # _ninja_contribute_args is a special attribute
-            # which allows developers to create custom function params
-            # inside decorators or other functions
-            for p_name, p_type, p_source in view_func._ninja_contribute_args:
-                self.params.append(
-                    FuncParam(p_name, p_source.alias or p_name, p_source, p_type, False)
-                )
+        # _ninja_contribute_args is a special attribute which allows
+        # developers to create custom function params inside decorators
+        # or other functions. We walk the __wrapped__ chain so stacked
+        # decorators (e.g. @paginate + @dynamic_response) all contribute,
+        # not just the outermost one.
+        from ninja.utils import collect_contributions
+
+        for p_name, p_type, p_source in collect_contributions(
+            view_func, "_ninja_contribute_args"
+        ):
+            self.params.append(
+                FuncParam(p_name, p_source.alias or p_name, p_source, p_type, False)
+            )
 
         self.models: TModels = self._create_models()
 

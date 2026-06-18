@@ -61,3 +61,41 @@ def contribute_operation_args(
     if not hasattr(func, "_ninja_contribute_args"):
         func._ninja_contribute_args = []  # type: ignore
     func._ninja_contribute_args.append((arg_name, arg_type, arg_source))  # type: ignore
+
+
+def collect_contributions(func: Callable[..., Any], attr: str) -> list:
+    """
+    Walk ``func.__wrapped__`` to accumulate ``_ninja_contribute_*`` lists
+    from every decorator in a ``functools.wraps``-preserving chain.
+
+    Without this, stacking two decorators that each call
+    ``contribute_operation_args`` / ``contribute_operation_callback`` only
+    runs the outermost decorator's contributions: the inner decorator's
+    attribute is set on a function the operation never inspects.
+
+    Items are returned outermost-first; callers that need
+    innermost-first ordering can reverse the result.
+    """
+    seen_ids = set()
+    result: list = []
+    current = func
+    while current is not None:
+        if id(current) in seen_ids:
+            break
+        seen_ids.add(id(current))
+        items = getattr(current, attr, None)
+        if items:
+            for item in items:
+                result.append(item)
+        current = getattr(current, "__wrapped__", None)
+    # Dedupe by identity while preserving order — the same list object can
+    # appear on multiple wrappers if an inner decorator passed its attribute
+    # up by mutating the outer function.
+    deduped: list = []
+    seen_item_ids = set()
+    for item in result:
+        if id(item) in seen_item_ids:
+            continue
+        seen_item_ids.add(id(item))
+        deduped.append(item)
+    return deduped

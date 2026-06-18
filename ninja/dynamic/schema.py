@@ -136,10 +136,31 @@ def unwrap_response_annotation(annotation: Any) -> "tuple[Type[Schema] | None, b
     Unwrap ``response=List[UserSchema]`` (or just ``UserSchema``) into
     ``(UserSchema, is_list)``. Returns ``(None, False)`` if there's no Schema
     underneath (e.g. a plain dict response).
+
+    Also looks one level inside a wrapper Schema that contains a single
+    ``List[InnerSchema]`` field — this is the shape pagination's
+    ``make_response_paginated`` produces (``Paged{Foo}.items``). Recognizing
+    it lets ``@dynamic_response`` capture the inner item schema regardless of
+    decorator stacking order.
     """
     from typing import get_args, get_origin
 
     if isinstance(annotation, type) and issubclass(annotation, Schema):
+        # If this Schema looks like a pagination-style wrapper (has a
+        # List[Schema] field), recurse into that field to find the item
+        # schema. We only recurse when the wrapper isn't itself a user-
+        # declared response schema — heuristic: a single List[Schema] field
+        # alongside other scalar metadata fields (count, next, previous, ...).
+        list_fields = []
+        for fname, fld in annotation.model_fields.items():
+            sub_ann = fld.annotation
+            if get_origin(sub_ann) is list:
+                args = get_args(sub_ann)
+                if args and isinstance(args[0], type) and issubclass(args[0], Schema):
+                    list_fields.append((fname, args[0]))
+        if len(list_fields) == 1:
+            _, inner = list_fields[0]
+            return inner, True
         return annotation, False
 
     origin = get_origin(annotation)

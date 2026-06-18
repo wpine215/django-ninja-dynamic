@@ -127,19 +127,18 @@ def _validate_input_against_meta(
 
     if config.strict_unknown and selector.sparse:
         from ninja.dynamic.openapi import walk_schema_graph
-        from ninja.dynamic.selector import schema_resource_name
+        from ninja.dynamic.selector import _alias_to_name, schema_resource_name
 
         schema_fields, _, _ = walk_schema_graph(schema)
         fields_by_resource = {
-            schema_resource_name(s): set(fields)
+            schema_resource_name(s): set(fields) | set(_alias_to_name(s).keys())
             for s, fields in schema_fields.items()
         }
-        all_known = set().union(*fields_by_resource.values())
 
         for resource, bucket in selector.sparse.items():
             if resource is None:
-                # Flat / unscoped — match against the root schema's defaults.
-                allowed = set(schema.model_fields)
+                # Root schema: accept field names and aliases interchangeably.
+                allowed = set(_alias_to_name(schema).keys())
             else:
                 allowed = fields_by_resource.get(resource)
                 if allowed is None:
@@ -180,6 +179,7 @@ def _modify_operation_for_dynamic(
     includable: Optional[List[str]],
     expandable: Optional[List[str]],
     op: Operation,
+    target_view: Callable[..., Any],
 ) -> None:
     schema, _ = _root_response_schema(op)
     if schema is None:
@@ -188,18 +188,30 @@ def _modify_operation_for_dynamic(
             f"{op.view_func.__module__}.{op.view_func.__name__})."
         )
 
-    # Stash state on view_func so it survives Operation.clone() — operations
-    # get cloned when a router is mounted into an API, and clones share
-    # view_func but not arbitrary _ninja_* attributes set during construction.
+    # Stash state on ``target_view`` — the specific wrapper created by our
+    # decorator — rather than on ``op.view_func``, because another decorator
+    # (e.g. @paginate) may have wrapped us. The dynamic wrapped view reads
+    # the state from itself; setting it on the outermost view_func would
+    # leave the inner wrapper blind.
     setattr(
-        op.view_func,
+        target_view,
         _VIEW_STATE_ATTR,
         _DynamicState(decorator_config, schema, includable, expandable),
     )
 
 
-def get_dynamic_state(op: Operation) -> Optional[_DynamicState]:
-    return getattr(op.view_func, _VIEW_STATE_ATTR, None)
+def get_dynamic_state(op_or_view) -> Optional[_DynamicState]:
+    """
+    Locate the dynamic state on a view chain, walking ``__wrapped__`` so we
+    find it whether or not other decorators wrap our wrapper.
+    """
+    current = getattr(op_or_view, "view_func", op_or_view)
+    while current is not None:
+        state = getattr(current, _VIEW_STATE_ATTR, None)
+        if state is not None:
+            return state
+        current = getattr(current, "__wrapped__", None)
+    return None
 
 
 def get_dynamic_openapi_parameters(op: Operation) -> List[dict]:
@@ -291,7 +303,9 @@ def _inject_dynamic(
     )
 
     def _callback(op: Operation) -> None:
-        _modify_operation_for_dynamic(config, includable, expandable, op)
+        _modify_operation_for_dynamic(
+            config, includable, expandable, op, target_view=view_with_dynamic
+        )
 
     contribute_operation_callback(view_with_dynamic, _callback)
 
