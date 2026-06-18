@@ -67,6 +67,8 @@ class NinjaAPI:
         parser: Optional[Parser] = None,
         default_router: Optional[Router] = None,
         openapi_extra: Optional[Dict[str, Any]] = None,
+        dynamic_fields_style: Optional[str] = None,
+        dynamic_config: Optional[Any] = None,
     ):
         """
         Args:
@@ -94,6 +96,15 @@ class NinjaAPI:
         self.renderer = renderer or JSONRenderer()
         self.parser = parser or Parser()
         self.openapi_extra = openapi_extra or {}
+
+        from ninja.dynamic.config import DynamicConfig
+
+        if dynamic_config is not None:
+            self.dynamic_config: Optional[DynamicConfig] = dynamic_config
+        elif dynamic_fields_style is not None:
+            self.dynamic_config = DynamicConfig(style=dynamic_fields_style)  # type: ignore[arg-type]
+        else:
+            self.dynamic_config = None
 
         self._exception_handlers: Dict[Exc, ExcHandler] = {}
         self.set_default_exception_handlers()

@@ -212,6 +212,9 @@ class Operation:
             return error
         try:
             temporal_response = self.api.create_temporal_response(request)
+            # Make the operation discoverable from inside the view (used by
+            # ninja.dynamic to look up api-level config at request time).
+            request._ninja_operation = self  # type: ignore[attr-defined]
             values = self._get_values(request, kw, temporal_response)
             result = self.view_func(request, **values)
             if self.stream_format:
@@ -347,6 +350,35 @@ class Operation:
             kwargs["context"] = {"request": request, "response_status": status}
         return kwargs
 
+    def _dynamic_dump_kwargs(
+        self, request: HttpRequest, response_model: Type[Schema]
+    ) -> Dict[str, Any]:
+        """
+        Return ``include`` / ``exclude`` kwargs for ``model_dump`` if the
+        request carries a dynamic-schema selector. Empty dict otherwise.
+        """
+        selector = getattr(request, "_ninja_dynamic_selector", None)
+        if selector is None or selector.is_empty:
+            return {}
+        schema = getattr(request, "_ninja_dynamic_response_schema", None)
+        if schema is None:
+            return {}
+
+        from typing import get_origin
+
+        from ninja.dynamic.selector import build_exclude, build_include
+
+        annotation = response_model.model_fields["response"].annotation
+        is_list = get_origin(annotation) is list
+        kwargs: Dict[str, Any] = {}
+        inc = build_include(selector, schema, is_list)
+        if inc is not None:
+            kwargs["include"] = inc
+        exc = build_exclude(selector, schema, is_list)
+        if exc is not None:
+            kwargs["exclude"] = exc
+        return kwargs
+
     def _result_to_response(
         self, request: HttpRequest, result: Any, temporal_response: HttpResponse
     ) -> HttpResponseBase:
@@ -398,6 +430,7 @@ class Operation:
             return temporal_response
 
         model_dump_kwargs = self._model_dump_kwargs(request, status)
+        dynamic_kwargs = self._dynamic_dump_kwargs(request, response_model)
 
         # Skip re-validation for pydantic model instances matching the response type
         resp_annotation = response_model.model_fields["response"].annotation
@@ -406,12 +439,20 @@ class Operation:
             and isinstance(result, BaseModel)
             and isinstance(result, resp_annotation)
         ):
+            # Unwrap dynamic include/exclude from the response envelope:
+            # at this point we are dumping the model directly, not via the
+            # NinjaResponseSchema wrapper.
+            direct_kwargs: Dict[str, Any] = dict(model_dump_kwargs)
+            if "include" in dynamic_kwargs:
+                direct_kwargs["include"] = dynamic_kwargs["include"].get("response")
+            if "exclude" in dynamic_kwargs:
+                direct_kwargs["exclude"] = dynamic_kwargs["exclude"].get("response")
             result = cast(BaseModel, result).model_dump(
                 by_alias=self.by_alias,
                 exclude_unset=self.exclude_unset,
                 exclude_defaults=self.exclude_defaults,
                 exclude_none=self.exclude_none,
-                **model_dump_kwargs,
+                **direct_kwargs,
             )
             return self.api.create_response(
                 request, result, temporal_response=temporal_response
@@ -429,6 +470,7 @@ class Operation:
             exclude_defaults=self.exclude_defaults,
             exclude_none=self.exclude_none,
             **model_dump_kwargs,
+            **dynamic_kwargs,
         )["response"]
         return self.api.create_response(
             request, result, temporal_response=temporal_response

@@ -4,8 +4,8 @@ build-backend = "flit_core.buildapi"
 
 [tool.flit.metadata]
 module = "ninja"
-dist-name = "django-ninja"
-author = "Vitaliy Kucheryaviy"
+dist-name = "django-ninja-dynamic"
+author = "django-ninja-dynamic contributors"
 author-email = "ppr.vitaly@gmail.com"
 home-page = "https://django-ninja.dev"
 classifiers = [

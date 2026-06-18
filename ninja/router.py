@@ -200,6 +200,8 @@ class Router:
         exclude_unset: Optional[bool] = None,
         exclude_defaults: Optional[bool] = None,
         exclude_none: Optional[bool] = None,
+        dynamic_fields_style: Optional[str] = None,
+        dynamic_config: Optional[Any] = None,
     ) -> None:
         self._frozen = False
         self.auth = auth
@@ -209,6 +211,15 @@ class Router:
         self.exclude_unset = exclude_unset
         self.exclude_defaults = exclude_defaults
         self.exclude_none = exclude_none
+
+        from ninja.dynamic.config import DynamicConfig
+
+        if dynamic_config is not None:
+            self.dynamic_config: Optional[DynamicConfig] = dynamic_config
+        elif dynamic_fields_style is not None:
+            self.dynamic_config = DynamicConfig(style=dynamic_fields_style)  # type: ignore[arg-type]
+        else:
+            self.dynamic_config = None
 
         self.path_operations: Dict[str, PathView] = {}
         self._routers: List[Tuple[str, Router, Optional[List[str]]]] = []
