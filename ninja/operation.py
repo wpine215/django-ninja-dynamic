@@ -134,11 +134,16 @@ class Operation:
         self.exclude_defaults = exclude_defaults or False
         self.exclude_none = exclude_none or False
 
-        if hasattr(view_func, "_ninja_contribute_to_operation"):
-            # Allow 3rd party code to contribute to the operation behavior
-            callbacks: List[Callable] = view_func._ninja_contribute_to_operation
-            for callback in callbacks:
-                callback(self)
+        # Allow third-party code to contribute to the operation. We walk
+        # the __wrapped__ chain so stacked decorators (e.g. @paginate +
+        # @dynamic_response) all get a chance to mutate the operation,
+        # not just the outermost wrapper.
+        from ninja.utils import collect_contributions
+
+        for callback in collect_contributions(
+            view_func, "_ninja_contribute_to_operation"
+        ):
+            callback(self)
 
     def clone(self) -> "Operation":
         """
@@ -355,7 +360,12 @@ class Operation:
     ) -> Dict[str, Any]:
         """
         Return ``include`` / ``exclude`` kwargs for ``model_dump`` if the
-        request carries a dynamic-schema selector. Empty dict otherwise.
+        request carries a dynamic-schema selector and the active response
+        envelope actually contains the captured schema. Empty dict otherwise.
+
+        The path-based wrapping handles both nested wrappers (pagination's
+        ``Paged.items``) and skips filtering entirely for unrelated schemas
+        (a 404 ``ErrorSchema`` when the captured schema is ``UserSchema``).
         """
         selector = getattr(request, "_ninja_dynamic_selector", None)
         if selector is None or selector.is_empty:
@@ -364,17 +374,24 @@ class Operation:
         if schema is None:
             return {}
 
-        from typing import get_origin
-
-        from ninja.dynamic.selector import build_exclude, build_include
+        from ninja.dynamic.selector import (
+            build_exclude_at_path,
+            build_include_at_path,
+            find_schema_location,
+        )
 
         annotation = response_model.model_fields["response"].annotation
-        is_list = get_origin(annotation) is list
+        location = find_schema_location(annotation, schema)
+        if location is None:
+            return {}
+
         kwargs: Dict[str, Any] = {}
-        inc = build_include(selector, schema, is_list)
+        inc = build_include_at_path(
+            selector, schema, location, envelope_annotation=annotation
+        )
         if inc is not None:
             kwargs["include"] = inc
-        exc = build_exclude(selector, schema, is_list)
+        exc = build_exclude_at_path(selector, schema, location)
         if exc is not None:
             kwargs["exclude"] = exc
         return kwargs
