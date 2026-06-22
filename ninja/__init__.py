@@ -1,13 +1,13 @@
 """
 django-ninja-dynamic — Django Ninja fork with per-request dynamic response schemas.
 
-Drop-in replacement for django-ninja. Adds opt-in ``?fields=``, ``?omit=``,
-``?include=``, and ``?expand=`` query-parameter support via the
-``@dynamic_response`` decorator and the ``DynamicSchema`` base class. See
-``ninja.dynamic`` for details.
+Drop-in replacement for django-ninja. Adds opt-in ``?fields=`` (sparse
+fieldset allowlist) and ``?include=`` (dot-paths into ``Includable`` opt-in
+fields) via the ``@dynamic_response`` decorator and the ``DynamicSchema``
+base class. See ``ninja.dynamic`` for details.
 """
 
-__version__ = "1.6.2.dev0+dynamic.1"
+__version__ = "1.6.2.dev0+dynamic.2"
 
 from pydantic import Field
 
@@ -43,7 +43,6 @@ from ninja.streaming import JSONL, SSE
 from ninja.dynamic import (  # noqa: E402
     DynamicConfig,
     DynamicSchema,
-    Expandable,
     Includable,
     dynamic_response,
 )
@@ -81,7 +80,6 @@ __all__ = [
     "Status",
     "DynamicConfig",
     "DynamicSchema",
-    "Expandable",
     "Includable",
     "dynamic_response",
 ]

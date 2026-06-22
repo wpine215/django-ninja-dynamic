@@ -38,19 +38,13 @@ def _classify_relation(model: Type[Model], orm_field_name: str) -> Optional[str]
     return "prefetch"
 
 
-def _walk_paths(
-    selector: FieldSelector, schema: Type[Schema]
-) -> List[Tuple[str, ...]]:
+def _walk_paths(selector: FieldSelector) -> List[Tuple[str, ...]]:
     """
-    All ORM-relation paths implied by the selector. Includes contribute a
-    one-segment path (``("posts",)``); expands contribute their full
-    dot-path (``("posts", "author")``). Paths are returned in shortest-first
-    order so callers can attach the deepest spec for each prefix.
+    All ORM-relation paths implied by the selector's ``?include=``
+    dot-paths, sorted shortest-first so callers can attach the deepest spec
+    for each prefix.
     """
-    paths: List[Tuple[str, ...]] = [(name,) for name in selector.includes]
-    paths.extend(selector.expands)
-    paths.sort(key=len)
-    return paths
+    return sorted(selector.includes, key=len)
 
 
 def apply_query_optimization(
@@ -59,10 +53,10 @@ def apply_query_optimization(
     """
     If ``result`` is a Django ``QuerySet`` (or ``Manager``) and ``schema`` is
     backed by a Django model, attach ``select_related`` / ``prefetch_related``
-    for every relation the selector pulls in. No-op for plain values, dicts,
-    or single model instances.
+    for every relation the selector pulls in via ``?include=``. No-op for
+    plain values, dicts, or single model instances.
     """
-    if selector.is_empty:
+    if not selector.includes:
         return result
 
     qs = result
@@ -82,7 +76,7 @@ def apply_query_optimization(
     select_chains: List[str] = []
     prefetch_chains: List[str] = []
 
-    for path in _walk_paths(selector, schema):
+    for path in _walk_paths(selector):
         kind = _classify_chain(path, schema, base_model)
         chain = "__".join(path)
         if kind == "select":

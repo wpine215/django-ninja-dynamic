@@ -4,7 +4,6 @@ import pytest
 
 from ninja import (
     DynamicSchema,
-    Expandable,
     Includable,
     NinjaAPI,
     dynamic_response,
@@ -15,22 +14,22 @@ from ninja.testing import TestClient
 class AuthorSchema(DynamicSchema):
     id: int
     name: str
-    bio: str
+    bio: Includable[str]
 
 
 class PostSchema(DynamicSchema):
     id: int
     title: str
     body: str
-    author: Expandable[AuthorSchema] = None
+    author: Includable[AuthorSchema]
 
 
 class UserSchema(DynamicSchema):
     id: int
     name: str
     email: str
-    bio: str
-    posts: Includable[List[PostSchema]] = None
+    bio: Includable[str]
+    posts: Includable[List[PostSchema]]
 
 
 def _payload(id: int = 1) -> dict:
@@ -75,9 +74,10 @@ def jsonapi_client():
     return TestClient(api)
 
 
-def test_default_returns_all_default_fields(flat_client):
+def test_default_response_hides_includable_fields(flat_client):
+    """Without any ``?include=``, bio and posts are absent."""
     r = flat_client.get("/users/1").json()
-    assert set(r) >= {"id", "name", "email", "bio", "posts"}
+    assert set(r) == {"id", "name", "email"}
 
 
 def test_sparse_fieldset(flat_client):
@@ -85,33 +85,53 @@ def test_sparse_fieldset(flat_client):
     assert r == {"name": "Alice", "email": "alice@example.com"}
 
 
-def test_omit_drops_field(flat_client):
-    r = flat_client.get("/users/1?omit=bio").json()
-    assert "bio" not in r
-    assert r["name"] == "Alice"
+def test_sparse_cannot_request_includable_field(flat_client):
+    """``?fields=`` is orthogonal to ``?include=``; including an includable
+    name in ``?fields=`` is a 422 with a helpful message."""
+    r = flat_client.get("/users/1?fields=name,bio")
+    assert r.status_code == 422
+    msg = r.json()["detail"][0]["msg"]
+    assert "includable" in msg.lower()
+    assert "include" in msg.lower()
 
 
-def test_include_brings_in_relation(flat_client):
-    r = flat_client.get("/users/1?include=posts").json()
-    assert isinstance(r["posts"], list)
-    assert r["posts"][0]["title"] == "T1"
+def test_include_brings_in_field(flat_client):
+    r = flat_client.get("/users/1?include=bio").json()
+    assert r["bio"] == "hello"
+    # Default fields still present.
+    assert "name" in r
+    # Other includables stay hidden.
+    assert "posts" not in r
 
 
-def test_expand_descends_into_relation(flat_client):
-    r = flat_client.get("/users/1?include=posts&expand=posts.author").json()
+def test_include_with_dot_path_descends(flat_client):
+    r = flat_client.get("/users/1?include=posts.author").json()
     assert r["posts"][0]["author"]["name"] == "Bob"
+    # author.bio is also includable, so should remain hidden.
+    assert "bio" not in r["posts"][0]["author"]
 
 
-def test_sparse_and_include_compose(flat_client):
-    r = flat_client.get("/users/1?fields=name,posts&include=posts").json()
-    assert set(r) == {"name", "posts"}
-    assert r["posts"][0]["title"] == "T1"
+def test_include_deeper_dot_path(flat_client):
+    r = flat_client.get("/users/1?include=posts.author.bio").json()
+    assert r["posts"][0]["author"]["bio"] == "bobbio"
+
+
+def test_sparse_and_include_compose_orthogonally(flat_client):
+    """``?fields=name&include=bio`` yields exactly {"name", "bio"}."""
+    r = flat_client.get("/users/1?fields=name&include=bio").json()
+    assert r == {"name": "Alice", "bio": "hello"}
 
 
 def test_list_response_sparse_applies_per_item(flat_client):
     r = flat_client.get("/users?fields=id,name").json()
     assert len(r) == 2
     assert all(set(item) == {"id", "name"} for item in r)
+
+
+def test_list_response_default_hides_includables(flat_client):
+    r = flat_client.get("/users").json()
+    for item in r:
+        assert set(item) == {"id", "name", "email"}
 
 
 def test_unknown_field_raises_validation_error(flat_client):
@@ -124,14 +144,15 @@ def test_unknown_include_raises_validation_error(flat_client):
     assert r.status_code == 422
 
 
-def test_fields_and_omit_together_raises(flat_client):
-    r = flat_client.get("/users/1?fields=name&omit=bio")
+def test_unknown_dot_path_segment_raises(flat_client):
+    # posts is a real includable; bogus underneath it is not.
+    r = flat_client.get("/users/1?include=posts.bogus")
     assert r.status_code == 422
 
 
 def test_jsonapi_per_resource_sparse(jsonapi_client):
     r = jsonapi_client.get(
-        "/users/1?fields%5Buser%5D=name,posts&fields%5Bpost%5D=title&include=posts"
+        "/users/1?fields%5Buser%5D=name&fields%5Bpost%5D=title&include=posts"
     ).json()
     assert set(r) == {"name", "posts"}
     assert r["posts"][0] == {"title": "T1"}
@@ -143,7 +164,7 @@ def test_decorator_factory_with_explicit_includable():
     class Plain(DynamicSchema):
         id: int
         name: str
-        meta: Includable[str] = None
+        meta: Includable[str]
 
     @api.get("/x", response=Plain)
     @dynamic_response(includable=["meta"])
@@ -151,6 +172,6 @@ def test_decorator_factory_with_explicit_includable():
         return {"id": 1, "name": "x", "meta": "abc"}
 
     client = TestClient(api)
+    assert client.get("/x").json() == {"id": 1, "name": "x"}
     assert client.get("/x?include=meta").json() == {"id": 1, "name": "x", "meta": "abc"}
-    # Disallowed include is rejected
     assert client.get("/x?include=bogus").status_code == 422

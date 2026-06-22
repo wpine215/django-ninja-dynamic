@@ -15,9 +15,7 @@ class DynamicConfig:
     style: SyntaxStyle = "flat"
 
     fields_param: str = "fields"
-    omit_param: str = "omit"
     include_param: str = "include"
-    expand_param: str = "expand"
 
     separator: str = ","
 
