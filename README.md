@@ -1,6 +1,6 @@
 # Django Ninja Dynamic
 
-**Django Ninja Dynamic** is a fork of [Django Ninja](https://django-ninja.dev) that adds **per-request dynamic response schemas**. Clients shape what the server returns by passing query parameters such as `?fields=`, `?omit=`, `?include=`, and `?expand=`, with the resulting behavior accurately reflected in the auto-generated OpenAPI/Swagger documentation.
+**Django Ninja Dynamic** is a fork of [Django Ninja](https://django-ninja.dev) that adds **per-request dynamic response schemas**. Clients shape what the server returns by passing two query parameters — `?fields=` and `?include=` — with the resulting behavior accurately reflected in the auto-generated OpenAPI/Swagger documentation.
 
 The package is a drop-in replacement: the import path remains `ninja`, so existing Django Ninja projects work unchanged.
 
@@ -14,13 +14,13 @@ The package is a drop-in replacement: the import path remains `ninja`, so existi
 
 **Additions in this fork:**
 
-- **Sparse fieldsets** via `?fields=` and `?omit=`.
-- **Optional relations** via `?include=` and **deep expansion** via `?expand=`.
-- **`DynamicSchema` base class** with `Includable[T]` / `Expandable[T]` field markers.
+- **`Includable[T]` field marker** — declares an opt-in field that is hidden from the default response and surfaced with `?include=`. Works for any type (not just FK relations).
+- **Sparse fieldsets** via `?fields=` — an allowlist over default-visible fields.
+- **Dot-path includes** via `?include=posts.author` — pull in a nested `Includable` field and descend into it in one parameter.
 - **`@dynamic_response` decorator** for per-endpoint opt-in.
-- **Both flat and JSON:API** query-parameter syntax styles, configurable per API or per Router.
-- **Automatic Django ORM optimization** (`select_related` / `prefetch_related`) driven by the request.
-- **Accurate OpenAPI documentation** of the dynamic behavior (response schema plus the four query parameters with their valid values).
+- **Both flat and JSON:API** query-parameter syntax styles, configurable per API.
+- **Automatic Django ORM optimization** (`select_related` / `prefetch_related`) driven by `?include=`.
+- **Accurate OpenAPI documentation** of the dynamic behavior: response schema plus the two query parameters with their valid values.
 
 **Upstream documentation**: https://django-ninja.dev
 
@@ -75,7 +75,6 @@ from ninja import (
     NinjaAPI,
     DynamicSchema,
     Includable,
-    Expandable,
     dynamic_response,
 )
 
@@ -83,20 +82,21 @@ from ninja import (
 class AuthorSchema(DynamicSchema):
     id: int
     name: str
+    bio: Includable[str]
 
 
 class PostSchema(DynamicSchema):
     id: int
     title: str
     body: str
-    author: Expandable[AuthorSchema] = None
+    author: Includable[AuthorSchema]
 
 
 class UserSchema(DynamicSchema):
     id: int
     name: str
     email: str
-    posts: Includable[List[PostSchema]] = None
+    posts: Includable[List[PostSchema]]
 
 
 api = NinjaAPI()
@@ -112,35 +112,43 @@ Sample requests:
 
 | Request | Response |
 | --- | --- |
-| `GET /api/users/1` | All default fields, with `posts: null`. |
+| `GET /api/users/1` | `id`, `name`, `email` only — `posts` is `Includable`, hidden by default. |
 | `GET /api/users/1?fields=name,email` | Only `name` and `email`. |
-| `GET /api/users/1?omit=email` | All default fields except `email`. |
-| `GET /api/users/1?include=posts` | Default fields plus the `posts` array. |
-| `GET /api/users/1?include=posts&expand=posts.author` | As above, with each post's `author` populated. |
+| `GET /api/users/1?include=posts` | Default fields + the `posts` array. |
+| `GET /api/users/1?include=posts.author` | Adds `posts`, with `author` populated on each. |
+| `GET /api/users/1?include=posts.author.bio` | All three nested levels populated. |
+| `GET /api/users/1?fields=name&include=posts` | `name` + `posts`. |
+| `GET /api/users/1?fields=name,posts` | **HTTP 422** — `posts` is includable, use `?include=` instead. |
 
 ### Query parameters
 
 | Parameter | Behavior |
 | --- | --- |
-| `fields` | Comma-separated list of fields to return. Acts as a sparse fieldset on the root response. |
-| `omit` | Comma-separated list of fields to drop. Cannot be combined with `fields`. |
-| `include` | Comma-separated list of opt-in relations declared `Includable[T]`. |
-| `expand` | Comma-separated dot-paths declared `Expandable[T]`, e.g. `posts.author`. |
+| `fields` | Comma-separated allowlist over **default-visible** fields. May not include `Includable` fields — use `?include=` for those. |
+| `include` | Comma-separated dot-paths over `Includable` fields. Each path segment must be `Includable` on its parent schema. |
 
-Unknown values raise an HTTP 422 validation error. Mixing `fields` and `omit` is rejected.
+The two parameters are **orthogonal**: `?fields=` filters defaults, `?include=` opts in. They compose without ambiguity.
 
-### `DynamicSchema`, `Includable`, and `Expandable`
+Unknown values raise an HTTP 422 validation error.
 
-Subclass `DynamicSchema` instead of `Schema` and annotate optional relations with `Includable[T]` or `Expandable[T]`. These markers are stripped before Pydantic sees the field; the field's runtime type becomes `Optional[T]`.
+### `DynamicSchema` and `Includable`
 
-- **`Includable[T]`** declares an opt-in relation that the client requests with `?include=field_name`.
-- **`Expandable[T]`** declares a nested field that the client reaches with `?expand=path.to.field`.
+Subclass `DynamicSchema` instead of `Schema` and annotate opt-in fields with `Includable[T]`. The metaclass strips the marker, rewrites the annotation to `Optional[T]`, and injects a default of `None` — no boilerplate required:
+
+```python
+class UserSchema(DynamicSchema):
+    id: int            # default-visible
+    name: str          # default-visible
+    posts: Includable[List[PostSchema]]   # hidden until ?include=posts
+```
 
 The discovered markers are exposed on the class as `__dynamic_meta__` and inherited by subclasses.
 
+`Includable` works for any field type, not just FK relations. A scalar like `bio: Includable[str]` is just as valid as a nested `Includable[List[PostSchema]]`.
+
 ### `@dynamic_response`
 
-The decorator wires the four query parameters into the operation, validates them against the response schema, and applies any requested ORM optimizations:
+The decorator wires the two query parameters into the operation, validates them against the response schema, and applies any requested ORM optimizations:
 
 ```python
 @api.get("/users/{id}", response=UserSchema)
@@ -149,18 +157,17 @@ def get_user(request, id: int):
     ...
 ```
 
-The decorator can also be used as a factory to set explicit lists or override config:
+The decorator can also be called as a factory to override defaults:
 
 ```python
 @dynamic_response(
     includable=["posts"],
-    expandable=["posts.author"],
     optimize_queryset=True,
     config=DynamicConfig(style="jsonapi"),
 )
 ```
 
-When the response schema is a `DynamicSchema`, `includable` and `expandable` default to the values declared via markers.
+When the response schema is a `DynamicSchema`, `includable` defaults to the names declared via markers.
 
 ### JSON:API syntax style
 
@@ -168,47 +175,45 @@ The fork supports two query-parameter syntaxes:
 
 | Style | Example |
 | --- | --- |
-| `flat` (default) | `?fields=name,email&include=posts` |
-| `jsonapi` | `?fields[user]=name,email&fields[post]=title&include=posts` |
+| `flat` (default) | `?fields=name,email&include=posts.author` |
+| `jsonapi` | `?fields[user]=name,email&fields[post]=title&include=posts.author` |
 
-Configure the style on the API or Router:
+Configure the style on the API:
 
 ```python
 api = NinjaAPI(dynamic_fields_style="jsonapi")
-router = Router(dynamic_fields_style="flat")
 ```
 
-Precedence for resolving the config is: decorator argument > API setting > default (`flat`).
+Precedence for resolving the config: decorator argument → API setting → default (`flat`).
 
-In `jsonapi` mode, `?include=posts.author` is automatically split into `includes={"posts"}` and `expands={("posts", "author")}`. Per-resource sparse fieldsets apply recursively wherever the matching resource appears in the response graph; flat `?fields=` applies only at the root.
+Per-resource sparse fieldsets in `jsonapi` mode apply recursively wherever the matching resource appears in the response graph; flat `?fields=` applies only at the root.
 
 ### ORM optimization
 
-When the response is a Django `QuerySet` and the schema is linked to a Django model (either via `ninja.ModelSchema`'s `Meta.model` or by setting `__django_model__` on a plain `DynamicSchema`), `?include=` and `?expand=` automatically attach `select_related` / `prefetch_related` to the queryset before it is evaluated.
+When the response is a Django `QuerySet` and the schema is linked to a Django model (either via `ninja.ModelSchema`'s `Meta.model` or by setting `__django_model__` on a plain `DynamicSchema`), `?include=` automatically attaches `select_related` / `prefetch_related` to the queryset before it is evaluated.
 
 Chains where every hop is a `ForeignKey` or `OneToOneField` are resolved with `select_related`; reverse and many-to-many relations use `prefetch_related`. The behavior can be disabled per endpoint with `@dynamic_response(optimize_queryset=False)`.
 
 ### OpenAPI documentation
 
-The OpenAPI document renders the **maximal** response schema (every includable and expandable field is present and optional) and adds the four query parameters with descriptions listing the valid values. For example:
+The OpenAPI document renders the **maximal** response schema (every `Includable` field is present and optional) and adds the two query parameters with descriptions listing the valid values. For example:
 
 ```yaml
 parameters:
   - in: query
     name: fields
-    description: "Sparse fieldset: comma-separated list of fields to return.
-                  Available on top-level response: id, name, email, posts."
+    description: "Sparse fieldset: comma-separated allowlist of fields
+                  to return. Includable fields are not valid here; use
+                  'include' for those. Available: id, name, email."
   - in: query
     name: include
-    description: "Comma-separated list of optional relations to include.
-                  Available: posts."
-  - in: query
-    name: expand
-    description: "Comma-separated dot-paths to expand nested relations.
-                  Available: posts.author."
+    description: "Comma-separated list of opt-in fields to include.
+                  Supports dot-paths (e.g. ``posts.author``) for
+                  nested inclusion. Available: posts, posts.author,
+                  posts.author.bio."
 ```
 
-In `jsonapi` mode the parameter list becomes `fields[user]`, `fields[post]`, etc., with one entry per resource discovered in the schema graph.
+In `jsonapi` mode the `fields` parameter is replaced by per-resource entries (`fields[user]`, `fields[post]`, etc.), one for each schema discovered in the response graph.
 
 ### Configuration reference
 
@@ -218,9 +223,7 @@ In `jsonapi` mode the parameter list becomes `fields[user]`, `fields[post]`, etc
 | --- | --- | --- |
 | `style` | `"flat"` | `"flat"` or `"jsonapi"`. |
 | `fields_param` | `"fields"` | Query-parameter name for the sparse fieldset. |
-| `omit_param` | `"omit"` | Query-parameter name for the omit list. |
-| `include_param` | `"include"` | Query-parameter name for include. |
-| `expand_param` | `"expand"` | Query-parameter name for expand. |
+| `include_param` | `"include"` | Query-parameter name for the include list. |
 | `separator` | `","` | Separator for list values within a single parameter. |
 | `strict_unknown` | `True` | When True, unknown field names raise 422; when False, they are silently dropped. |
 | `jsonapi_resource_aliases` | `()` | Tuple of `(alias, canonical)` pairs for `fields[alias]` rewriting. |

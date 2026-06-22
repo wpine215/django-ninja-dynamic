@@ -1,9 +1,8 @@
 import re
-from typing import Iterable, Mapping, Optional, Tuple
+from typing import Iterable, Mapping, Optional
 
 from ninja.dynamic.config import DynamicConfig
 from ninja.dynamic.selector import FieldSelector
-from ninja.errors import ValidationError
 
 _BRACKET_PARAM_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[([A-Za-z0-9_]+)\]$")
 
@@ -46,24 +45,12 @@ def parse_query(
     """
     Parse a Django ``QueryDict`` (or any string-keyed mapping) into a
     ``FieldSelector`` according to the configured syntax style.
-
-    Raises ``ValidationError`` if ``fields`` and ``omit`` are both present,
-    or if JSON:API style sparse uses an empty resource name.
     """
     if config.style == "flat":
-        sel = _parse_flat(query, config)
-    elif config.style == "jsonapi":
-        sel = _parse_jsonapi(query, config)
-    else:  # pragma: no cover
-        raise ValueError(f"Unknown dynamic style: {config.style}")
-
-    if sel.sparse and sel.omit:
-        raise ValidationError([{
-            "type": "value_error",
-            "loc": ("query", config.fields_param),
-            "msg": f"Use either '{config.fields_param}' or '{config.omit_param}', not both.",
-        }])
-    return sel
+        return _parse_flat(query, config)
+    if config.style == "jsonapi":
+        return _parse_jsonapi(query, config)
+    raise ValueError(f"Unknown dynamic style: {config.style}")  # pragma: no cover
 
 
 def _parse_flat(
@@ -76,17 +63,11 @@ def _parse_flat(
     if raw is not None:
         sel.sparse[None] = set(_split(raw, sep))
 
-    raw = _gather(query, config.omit_param)
-    if raw is not None:
-        sel.omit[None] = set(_split(raw, sep))
-
+    # ``?include=`` accepts dot-paths in flat mode too. ``?include=posts``
+    # opts the field in; ``?include=posts.author`` opts in and descends.
     raw = _gather(query, config.include_param)
     if raw is not None:
-        sel.includes |= set(_split(raw, sep))
-
-    raw = _gather(query, config.expand_param)
-    if raw is not None:
-        sel.expands |= _parse_path_set(raw, sep)
+        sel.includes |= _parse_path_set(raw, sep)
 
     return sel
 
@@ -106,32 +87,16 @@ def _parse_jsonapi(
             continue
         param, resource = m.group(1), m.group(2)
         resource = aliases.get(resource, resource)
-        target: Optional[dict] = None
-        if param == config.fields_param:
-            target = sel.sparse
-        elif param == config.omit_param:
-            target = sel.omit
-        if target is None:
+        if param != config.fields_param:
             continue
         raw = _gather(query, key)
         if raw is None:
             continue
-        target.setdefault(resource, set()).update(_split(raw, sep))
+        sel.sparse.setdefault(resource, set()).update(_split(raw, sep))
 
-    # JSON:API ``include`` is dot-pathed: ``include=posts.author,comments``
-    # We split into top-level ``includes`` and the rest as ``expands``.
+    # JSON:API ``include`` is dot-pathed: ``include=posts.author,comments``.
     raw = _gather(query, config.include_param)
     if raw is not None:
-        for path_str in _split(raw, sep):
-            parts = tuple(path_str.split("."))
-            sel.includes.add(parts[0])
-            if len(parts) > 1:
-                sel.expands.add(parts)
-
-    # An explicit expand=... param remains supported in JSON:API mode for
-    # symmetry with flat — it adds to expands without altering includes.
-    raw = _gather(query, config.expand_param)
-    if raw is not None:
-        sel.expands |= _parse_path_set(raw, sep)
+        sel.includes |= _parse_path_set(raw, sep)
 
     return sel

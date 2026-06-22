@@ -47,25 +47,24 @@ class DynamicMeta(Dict[str, Set[str]]):
     """
     Per-schema metadata describing which fields are dynamic.
 
-    Built by ``DynamicMetaclass`` from ``Includable[T]`` / ``Expandable[T]``
-    annotations and inherited from base classes.
+    Built by ``DynamicMetaclass`` from ``Includable[T]`` annotations and
+    inherited from base classes.
     """
 
     includable: Set[str]
-    expandable: Set[str]
 
-    def __init__(self, includable: Set[str], expandable: Set[str]):
+    def __init__(self, includable: Set[str]):
         super().__init__()
         self["includable"] = self.includable = set(includable)
-        self["expandable"] = self.expandable = set(expandable)
 
 
 class DynamicMetaclass(ResolverMetaclass):
     """
-    Inspects ``Includable[T]`` / ``Expandable[T]`` annotations on a
-    ``DynamicSchema`` subclass, strips the markers so Pydantic sees the
-    underlying type (wrapped in ``Optional``), and stashes the discovered
-    fields on ``__dynamic_meta__``.
+    Inspects ``Includable[T]`` annotations on a ``DynamicSchema`` subclass,
+    strips the marker so Pydantic sees the underlying type (rewritten as
+    ``Optional[T]``), injects a default of ``None`` when the user didn't
+    supply one, and stashes the discovered field names on
+    ``__dynamic_meta__``.
     """
 
     __dynamic_meta__: DynamicMeta
@@ -74,7 +73,6 @@ class DynamicMetaclass(ResolverMetaclass):
     def __new__(cls, name, bases, namespace, **kwargs):
         annotations = _read_namespace_annotations(namespace)
         local_includable: Set[str] = set()
-        local_expandable: Set[str] = set()
 
         for fname, ann in list(annotations.items()):
             inner, kind = unwrap_marker(ann)
@@ -83,43 +81,46 @@ class DynamicMetaclass(ResolverMetaclass):
             annotations[fname] = Optional[inner]
             if kind == "includable":
                 local_includable.add(fname)
-            elif kind == "expandable":
-                local_expandable.add(fname)
+            # Inject default=None when not provided. Without this, Pydantic
+            # treats the field as required and any response validation that
+            # doesn't supply data raises. Marker fields are hidden by
+            # default, so a None default is always the right answer; users
+            # who need a different default should drop the marker and
+            # declare the field plainly.
             namespace.setdefault(fname, None)
 
         _write_namespace_annotations(namespace, annotations)
 
         merged_includable: Set[str] = set(local_includable)
-        merged_expandable: Set[str] = set(local_expandable)
         for base in bases:
             base_meta = getattr(base, "__dynamic_meta__", None)
             if isinstance(base_meta, DynamicMeta):
                 merged_includable |= base_meta.includable
-                merged_expandable |= base_meta.expandable
 
-        namespace["__dynamic_meta__"] = DynamicMeta(
-            includable=merged_includable, expandable=merged_expandable
-        )
+        namespace["__dynamic_meta__"] = DynamicMeta(includable=merged_includable)
         return super().__new__(cls, name, bases, namespace, **kwargs)
 
 
 class DynamicSchema(Schema, metaclass=DynamicMetaclass):
     """
-    Schema base class that auto-detects ``Includable[T]`` / ``Expandable[T]``
-    annotated fields, exposes them via ``__dynamic_meta__``, and is recognized
-    by ``@dynamic_response`` and the ``RouterDynamic``-style auto-wiring.
+    Schema base class that auto-detects ``Includable[T]`` annotated fields,
+    exposes them via ``__dynamic_meta__``, and is recognized by
+    ``@dynamic_response``.
 
     Example::
 
         class PostSchema(DynamicSchema):
             id: int
             title: str
-            author: Expandable[AuthorSchema] = None
 
         class UserSchema(DynamicSchema):
             id: int
             name: str
-            posts: Includable[List[PostSchema]] = None
+            posts: Includable[List[PostSchema]]
+
+    The ``posts`` field is hidden from default responses; clients opt in
+    with ``?include=posts``. No explicit ``= None`` default is needed —
+    the metaclass adds it.
     """
 
     __dynamic_meta__: DynamicMeta
@@ -146,11 +147,6 @@ def unwrap_response_annotation(annotation: Any) -> "tuple[Type[Schema] | None, b
     from typing import get_args, get_origin
 
     if isinstance(annotation, type) and issubclass(annotation, Schema):
-        # If this Schema looks like a pagination-style wrapper (has a
-        # List[Schema] field), recurse into that field to find the item
-        # schema. We only recurse when the wrapper isn't itself a user-
-        # declared response schema — heuristic: a single List[Schema] field
-        # alongside other scalar metadata fields (count, next, previous, ...).
         list_fields = []
         for fname, fld in annotation.model_fields.items():
             sub_ann = fld.annotation

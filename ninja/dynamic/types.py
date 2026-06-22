@@ -5,11 +5,11 @@ T = TypeVar("T")
 
 class _DynamicMarker:
     """
-    Base class for Includable / Expandable annotation markers.
+    Base class for the ``Includable`` annotation marker.
 
-    Used as `Includable[List[PostSchema]]` in schema field annotations so
-    DynamicSchema can auto-detect which fields are includable / expandable
-    via class-creation introspection.
+    Used as ``Includable[List[PostSchema]]`` in schema field annotations so
+    ``DynamicSchema`` can auto-detect which fields are opt-in via
+    class-creation introspection.
     """
 
     kind: str = ""
@@ -31,38 +31,32 @@ class _Marked:
 
 class Includable(_DynamicMarker):
     """
-    Marker: annotate a field that is opt-in via `?include=field_name`.
+    Marker: annotate a field that is opt-in via ``?include=field_name``.
 
-    The field type T is unwrapped at metaclass time, so Pydantic still
-    sees the underlying type. Example::
+    The field is hidden from the default response. The client opts it in
+    with ``?include=field_name``; dot-paths request deep inclusion
+    (``?include=posts.author`` brings in ``posts`` and descends into
+    ``author`` on each item).
+
+    The field type ``T`` is rewritten by ``DynamicSchema``'s metaclass as
+    ``Optional[T]`` with a default of ``None``, so no explicit default is
+    needed. Example::
 
         class UserSchema(DynamicSchema):
-            posts: Includable[List[PostSchema]] = None
+            id: int
+            name: str
+            posts: Includable[List[PostSchema]]
     """
 
     kind = "includable"
 
 
-class Expandable(_DynamicMarker):
-    """
-    Marker: annotate a field that is opt-in via `?expand=path`.
-
-    Differs from Includable in intent: expand is for deep dot-path expansion
-    on already-included relations (e.g. `?expand=posts.author`). Example::
-
-        class PostSchema(DynamicSchema):
-            author: Expandable[AuthorSchema] = None
-    """
-
-    kind = "expandable"
-
-
 def unwrap_marker(annotation: Any) -> "tuple[Any, str | None]":
     """
-    If ``annotation`` is a Marked annotation, return ``(inner_type, kind)``.
+    If ``annotation`` is a ``_Marked`` annotation, return ``(inner_type, kind)``.
 
-    Otherwise return ``(annotation, None)``. Used by DynamicSchema's metaclass
-    to strip markers before handing annotations to Pydantic.
+    Otherwise return ``(annotation, None)``. Used by ``DynamicSchema``'s
+    metaclass to strip markers before handing annotations to Pydantic.
     """
     if isinstance(annotation, _Marked):
         return annotation.inner, annotation.kind

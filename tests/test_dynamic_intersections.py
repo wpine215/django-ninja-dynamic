@@ -22,7 +22,6 @@ import pytest
 
 from ninja import (
     DynamicSchema,
-    Expandable,
     Field,
     FilterSchema,
     Includable,
@@ -43,7 +42,7 @@ class UserSchema(DynamicSchema):
     id: int
     name: str
     email: str
-    bio: Includable[str] = None
+    bio: Includable[str]
 
 
 class ErrorSchema(Schema):
@@ -102,16 +101,16 @@ class TestPaginationIntersection:
         r = pag_outer.get("/users?fields=name&page=2").json()
         assert r == {"items": [{"name": "U3"}, {"name": "U4"}], "count": 5}
 
-    def test_pag_outer_omit_works(self, pag_outer):
-        r = pag_outer.get("/users?omit=email,bio").json()
+    def test_pag_outer_default_hides_includables_in_items(self, pag_outer):
+        r = pag_outer.get("/users").json()
         items = r["items"]
-        assert all("email" not in i and "bio" not in i for i in items)
-        assert all("name" in i for i in items)
+        assert all("bio" not in i for i in items)
+        assert r["count"] == 5
 
-    def test_pag_outer_include_works(self, pag_outer):
-        r = pag_outer.get("/users?fields=name,bio&include=bio").json()
+    def test_pag_outer_include_brings_in_field(self, pag_outer):
+        r = pag_outer.get("/users?include=bio").json()
         items = r["items"]
-        assert items[0] == {"name": "U1", "bio": "bio1"}
+        assert items[0]["bio"] == "bio1"
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +172,6 @@ class TestByAlias:
         r = client.get("/u/1?fields=full_name").json()
         assert r == {"name": "Alice"}
 
-    def test_omit_accepts_alias(self, client):
-        r = client.get("/u/1?omit=name").json()
-        assert "name" not in r
-        assert r["email"] == "a@x"
-
     def test_unknown_name_rejected(self, client):
         r = client.get("/u/1?fields=bogus")
         assert r.status_code == 422
@@ -227,21 +221,28 @@ class TestExcludeNone:
     def client(self):
         api = NinjaAPI(urls_namespace="i5")
 
-        @api.get("/u/{id}", response=UserSchema, exclude_none=True)
+        # bio is not Includable here so we can test exclude_none behavior
+        # without the new default-hide semantics swallowing the field first.
+        class Plain(DynamicSchema):
+            id: int
+            name: str
+            email: Optional[str] = None
+
+        @api.get("/u/{id}", response=Plain, exclude_none=True)
         @dynamic_response
         def get_user(request, id: int):
-            return {"id": id, "name": "Alice", "email": "a@x", "bio": None}
+            return {"id": id, "name": "Alice", "email": None}
 
         return TestClient(api)
 
-    def test_none_bio_dropped_by_default(self, client):
+    def test_none_field_dropped_by_default(self, client):
         r = client.get("/u/1").json()
-        assert "bio" not in r
+        assert "email" not in r
         assert r["name"] == "Alice"
 
     def test_sparse_with_exclude_none_composes(self, client):
-        r = client.get("/u/1?fields=name,email").json()
-        assert r == {"name": "Alice", "email": "a@x"}
+        r = client.get("/u/1?fields=name").json()
+        assert r == {"name": "Alice"}
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +280,10 @@ class TestOpenAPIExtraPreservation:
         assert "X-Trace-Id" in names
         # Our dynamic params
         assert "fields" in names
-        assert "omit" in names
         assert "include" in names
+        # Removed params should not appear
+        assert "omit" not in names
+        assert "expand" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +327,6 @@ class TestIncludeInSchemaFalse:
             return {}
 
         schema = api.get_openapi_schema(path_prefix="/api/")
-        # The operation isn't emitted at all when include_in_schema=False —
-        # whether through the regular path entry or as a phantom dynamic
-        # operation. Either is acceptable; assert it's not there.
         assert "/api/hidden" not in schema["paths"]
 
 
@@ -345,11 +345,6 @@ class TestStreamingGracefulNoOp:
 
         api = NinjaAPI(urls_namespace="i9")
 
-        # Streaming responses use JSONL[Schema] / SSE[Schema] generics
-        # instead of Schema or List[Schema]. @dynamic_response is expected
-        # to either no-op (dynamic_dump_kwargs returns empty because the
-        # captured schema is wrapped in a StreamFormat) or raise a clear
-        # ConfigError at decoration time.
         try:
             @api.get("/stream", response=JSONL[UserSchema])
             @dynamic_response
@@ -357,14 +352,10 @@ class TestStreamingGracefulNoOp:
                 for u in _users_payload(3):
                     yield u
         except Exception as exc:
-            # Acceptable: a clear error at decoration time mentioning the
-            # streaming surface.
             msg = str(exc).lower()
             assert "stream" in msg or "dynamic" in msg or "response" in msg, exc
             return
 
-        # If registration succeeded, the endpoint still works (streaming
-        # responses are sent as-is; the dynamic filter is inert).
         r = TestClient(api).get("/stream")
         assert r.status_code == 200
 
@@ -401,7 +392,6 @@ class TestModelSchemaConflict:
             title: str
             __django_model__ = Event
 
-        # The attribute survives the metaclass.
         assert EventOut.__django_model__ is Event
 
 
@@ -446,8 +436,8 @@ class TestFilterSchemaCohabitation:
     def test_filter_schema_query_params_do_not_collide(self):
         """
         FilterSchema attaches query params with the names of its fields.
-        It must not collide with dynamic's ``fields``/``omit``/``include``/
-        ``expand`` params on a single endpoint — both feature sets coexist.
+        It must not collide with dynamic's ``fields``/``include`` params on
+        a single endpoint — both feature sets coexist.
         """
         from ninja import Query
 
@@ -465,9 +455,9 @@ class TestFilterSchemaCohabitation:
             return users
 
         c = TestClient(api)
-        # Filter alone
+        # Filter alone (default response hides bio since it's Includable)
         r = c.get("/users?name_starts=U2").json()
-        assert r == [{"id": 2, "name": "U2", "email": "u2@x", "bio": "bio2"}]
+        assert r == [{"id": 2, "name": "U2", "email": "u2@x"}]
         # Filter + dynamic sparse together
         r = c.get("/users?name_starts=U3&fields=name").json()
         assert r == [{"name": "U3"}]

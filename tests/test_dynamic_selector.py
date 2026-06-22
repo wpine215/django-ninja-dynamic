@@ -1,9 +1,8 @@
-from typing import List, Optional
+from typing import List
 
-from ninja import DynamicSchema, Expandable, Includable, Schema
+from ninja import DynamicSchema, Includable, Schema
 from ninja.dynamic.selector import (
     FieldSelector,
-    build_exclude,
     build_include,
     schema_resource_name,
 )
@@ -12,22 +11,21 @@ from ninja.dynamic.selector import (
 class AuthorSchema(DynamicSchema):
     id: int
     name: str
-    bio: str
+    bio: Includable[str]
 
 
 class PostSchema(DynamicSchema):
     id: int
     title: str
     body: str
-    author: Expandable[AuthorSchema] = None
+    author: Includable[AuthorSchema]
 
 
 class UserSchema(DynamicSchema):
     id: int
     name: str
     email: str
-    bio: str
-    posts: Includable[List[PostSchema]] = None
+    posts: Includable[List[PostSchema]]
 
 
 def test_resource_name_strips_schema_suffix():
@@ -42,48 +40,97 @@ def test_resource_name_snake_cases_camel_case():
     assert schema_resource_name(BlogPost) == "blog_post"
 
 
-def test_build_include_sparse_object():
+def test_default_includable_fields_hidden():
+    """No selector input: the default-visible set is emitted, includables dropped."""
+    sel = FieldSelector()
+    out = build_include(sel, UserSchema, is_list_response=False)
+    assert out == {"response": {"id": True, "name": True, "email": True}}
+
+
+def test_default_with_no_includables_returns_none():
+    """A schema with no Includable fields needs no filtering."""
+
+    class Plain(Schema):
+        a: int
+        b: str
+
+    sel = FieldSelector()
+    out = build_include(sel, Plain, is_list_response=False)
+    assert out is None
+
+
+def test_sparse_only_filters_default_visible():
     sel = FieldSelector(sparse={None: {"name", "email"}})
     out = build_include(sel, UserSchema, is_list_response=False)
     assert out == {"response": {"name": True, "email": True}}
 
 
-def test_build_include_sparse_list_uses_all_key():
-    sel = FieldSelector(sparse={None: {"name"}})
-    out = build_include(sel, UserSchema, is_list_response=True)
-    assert out == {"response": {"__all__": {"name": True}}}
-
-
-def test_build_include_returns_none_when_no_sparse():
-    sel = FieldSelector(includes={"posts"})
+def test_sparse_drops_includable_in_safety_net():
+    """
+    Validator rejects includable in ?fields= at 422, but as a defense in
+    depth the selector also drops them.
+    """
+    sel = FieldSelector(sparse={None: {"name", "posts"}})
     out = build_include(sel, UserSchema, is_list_response=False)
-    assert out is None
+    assert out == {"response": {"name": True}}
 
 
-def test_build_include_recurses_along_expand_path():
-    sel = FieldSelector(
-        sparse={None: {"name", "posts"}},
-        expands={("posts", "author")},
-    )
+def test_include_top_level_brings_in_default_visible_plus():
+    sel = FieldSelector(includes={("posts",)})
     out = build_include(sel, UserSchema, is_list_response=False)
     assert out == {
         "response": {
+            "id": True,
             "name": True,
+            "email": True,
+            "posts": {"__all__": {"id": True, "title": True, "body": True}},
+        }
+    }
+
+
+def test_include_dot_path_descends():
+    sel = FieldSelector(includes={("posts", "author")})
+    out = build_include(sel, UserSchema, is_list_response=False)
+    assert out == {
+        "response": {
+            "id": True,
+            "name": True,
+            "email": True,
             "posts": {
                 "__all__": {
                     "id": True,
                     "title": True,
                     "body": True,
-                    "author": True,
+                    "author": {"id": True, "name": True},
                 }
             },
         }
     }
 
 
-def test_build_include_recurses_into_jsonapi_per_resource_sparse():
+def test_sparse_and_include_compose():
+    sel = FieldSelector(
+        sparse={None: {"name"}}, includes={("posts",)}
+    )
+    out = build_include(sel, UserSchema, is_list_response=False)
+    assert out == {
+        "response": {
+            "name": True,
+            "posts": {"__all__": {"id": True, "title": True, "body": True}},
+        }
+    }
+
+
+def test_sparse_list_uses_all_key():
+    sel = FieldSelector(sparse={None: {"name"}})
+    out = build_include(sel, UserSchema, is_list_response=True)
+    assert out == {"response": {"__all__": {"name": True}}}
+
+
+def test_jsonapi_per_resource_sparse():
     sel = FieldSelector(
         sparse={"user": {"name", "posts"}, "post": {"title"}},
+        includes={("posts",)},
     )
     out = build_include(sel, UserSchema, is_list_response=False)
     assert out == {
@@ -94,21 +141,9 @@ def test_build_include_recurses_into_jsonapi_per_resource_sparse():
     }
 
 
-def test_build_exclude_top_level_omit():
-    sel = FieldSelector(omit={None: {"bio"}})
-    out = build_exclude(sel, UserSchema, is_list_response=False)
-    assert out == {"response": {"bio": True}}
-
-
-def test_build_exclude_ignores_unknown_field_name():
-    sel = FieldSelector(omit={None: {"not_a_field"}})
-    assert build_exclude(sel, UserSchema, is_list_response=False) is None
-
-
 def test_fields_for_falls_back_to_unscoped_only_at_root():
     sel = FieldSelector(sparse={None: {"name"}})
     assert sel.fields_for(UserSchema, is_root=True) == frozenset({"name"})
-    # Flat sparse does not propagate into nested resources.
     assert sel.fields_for(PostSchema, is_root=False) is None
 
 
@@ -116,3 +151,10 @@ def test_fields_for_prefers_resource_match_over_unscoped():
     sel = FieldSelector(sparse={None: {"x"}, "user": {"y"}})
     assert sel.fields_for(UserSchema, is_root=True) == frozenset({"y"})
     assert sel.fields_for(UserSchema, is_root=False) == frozenset({"y"})
+
+
+def test_child_paths_at_root():
+    sel = FieldSelector(includes={("posts",), ("posts", "author"), ("other",)})
+    assert sel.child_paths_at(()) == {"posts", "other"}
+    assert sel.child_paths_at(("posts",)) == {"author"}
+    assert sel.child_paths_at(("missing",)) == set()

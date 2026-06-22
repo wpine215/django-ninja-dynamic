@@ -359,42 +359,33 @@ class Operation:
         self, request: HttpRequest, response_model: Type[Schema]
     ) -> Dict[str, Any]:
         """
-        Return ``include`` / ``exclude`` kwargs for ``model_dump`` if the
-        request carries a dynamic-schema selector and the active response
-        envelope actually contains the captured schema. Empty dict otherwise.
+        Return an ``include`` kwarg for ``model_dump`` whenever the captured
+        schema needs filtering — that is, whenever it has ``Includable``
+        fields (default-hidden) or the caller passed ``?fields=`` /
+        ``?include=``. Empty dict otherwise.
 
         The path-based wrapping handles both nested wrappers (pagination's
         ``Paged.items``) and skips filtering entirely for unrelated schemas
         (a 404 ``ErrorSchema`` when the captured schema is ``UserSchema``).
         """
         selector = getattr(request, "_ninja_dynamic_selector", None)
-        if selector is None or selector.is_empty:
-            return {}
         schema = getattr(request, "_ninja_dynamic_response_schema", None)
-        if schema is None:
+        if selector is None or schema is None:
             return {}
 
-        from ninja.dynamic.selector import (
-            build_exclude_at_path,
-            build_include_at_path,
-            find_schema_location,
-        )
+        from ninja.dynamic.selector import build_include_at_path, find_schema_location
 
         annotation = response_model.model_fields["response"].annotation
         location = find_schema_location(annotation, schema)
         if location is None:
             return {}
 
-        kwargs: Dict[str, Any] = {}
         inc = build_include_at_path(
             selector, schema, location, envelope_annotation=annotation
         )
-        if inc is not None:
-            kwargs["include"] = inc
-        exc = build_exclude_at_path(selector, schema, location)
-        if exc is not None:
-            kwargs["exclude"] = exc
-        return kwargs
+        if inc is None:
+            return {}
+        return {"include": inc}
 
     def _result_to_response(
         self, request: HttpRequest, result: Any, temporal_response: HttpResponse
@@ -462,8 +453,6 @@ class Operation:
             direct_kwargs: Dict[str, Any] = dict(model_dump_kwargs)
             if "include" in dynamic_kwargs:
                 direct_kwargs["include"] = dynamic_kwargs["include"].get("response")
-            if "exclude" in dynamic_kwargs:
-                direct_kwargs["exclude"] = dynamic_kwargs["exclude"].get("response")
             result = cast(BaseModel, result).model_dump(
                 by_alias=self.by_alias,
                 exclude_unset=self.exclude_unset,

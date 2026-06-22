@@ -4,7 +4,6 @@ import pytest
 
 from ninja import (
     DynamicSchema,
-    Expandable,
     Includable,
     NinjaAPI,
     dynamic_response,
@@ -20,14 +19,14 @@ class PostSchema(DynamicSchema):
     id: int
     title: str
     body: str
-    author: Expandable[AuthorSchema] = None
+    author: Includable[AuthorSchema]
 
 
 class UserSchema(DynamicSchema):
     id: int
     name: str
     email: str
-    posts: Includable[List[PostSchema]] = None
+    posts: Includable[List[PostSchema]]
 
 
 def _params_by_name(api: NinjaAPI, path: str) -> dict:
@@ -61,24 +60,39 @@ def jsonapi_api():
     return api
 
 
-def test_flat_adds_all_four_query_params(flat_api):
+def test_flat_emits_fields_and_include_params(flat_api):
     params = _params_by_name(flat_api, "/api/users/{id}")
-    assert {"fields", "omit", "include", "expand"}.issubset(params)
+    assert {"fields", "include"}.issubset(params)
 
 
-def test_flat_fields_param_lists_available_fields(flat_api):
+def test_flat_no_omit_or_expand_params(flat_api):
     params = _params_by_name(flat_api, "/api/users/{id}")
-    assert "id, name, email, posts" in params["fields"]["description"]
+    assert "omit" not in params
+    assert "expand" not in params
 
 
-def test_flat_include_param_lists_includables(flat_api):
+def test_flat_fields_lists_default_visible_only(flat_api):
     params = _params_by_name(flat_api, "/api/users/{id}")
-    assert "posts" in params["include"]["description"]
+    desc = params["fields"]["description"]
+    # Default-visible fields appear
+    assert "id" in desc
+    assert "name" in desc
+    assert "email" in desc
+    # Includable fields do NOT appear in the fields description
+    assert "posts" not in desc.split("Available:")[-1]
 
 
-def test_flat_expand_lists_dot_paths(flat_api):
+def test_flat_fields_description_directs_to_include(flat_api):
     params = _params_by_name(flat_api, "/api/users/{id}")
-    assert "posts.author" in params["expand"]["description"]
+    desc = params["fields"]["description"]
+    assert "include" in desc.lower()
+
+
+def test_flat_include_lists_includable_dot_paths(flat_api):
+    params = _params_by_name(flat_api, "/api/users/{id}")
+    desc = params["include"]["description"]
+    assert "posts" in desc
+    assert "posts.author" in desc
 
 
 def test_jsonapi_emits_per_resource_brackets(jsonapi_api):
@@ -88,6 +102,12 @@ def test_jsonapi_emits_per_resource_brackets(jsonapi_api):
     assert "fields[author]" in params
 
 
+def test_jsonapi_include_present(jsonapi_api):
+    params = _params_by_name(jsonapi_api, "/api/users/{id}")
+    assert "include" in params
+    assert "posts.author" in params["include"]["description"]
+
+
 def test_non_dynamic_endpoint_has_no_dynamic_params():
     api = NinjaAPI(urls_namespace="no-dyn-doc")
 
@@ -95,14 +115,14 @@ def test_non_dynamic_endpoint_has_no_dynamic_params():
     def plain(request):
         return {}
 
-    params = _params_by_name(api, "/api/plain")
-    assert not {"fields", "omit", "include", "expand"} & params.keys()
+    op = api.get_openapi_schema(path_prefix="/api/")["paths"]["/api/plain"]["get"]
+    names = {p["name"] for p in op["parameters"]}
+    assert "fields" not in names
+    assert "include" not in names
 
 
 def test_response_schema_preserved_in_openapi(flat_api):
     schema = flat_api.get_openapi_schema(path_prefix="/api/")
     op = schema["paths"]["/api/users/{id}"]["get"]
     content = op["responses"][200]["content"]
-    # Maximal-schema strategy: the response component still references the
-    # full UserSchema with the optional `posts` field present.
     assert "application/json" in content
