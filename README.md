@@ -194,6 +194,17 @@ When the response is a Django `QuerySet` and the schema is linked to a Django mo
 
 Chains where every hop is a `ForeignKey` or `OneToOneField` are resolved with `select_related`; reverse and many-to-many relations use `prefetch_related`. The behavior can be disabled per endpoint with `@dynamic_response(optimize_queryset=False)`.
 
+**Resolver-backed fields and reverse relations**
+
+The optimizer keys off the **schema field name**, not the resolver's body. So `posts: Includable[List[PostSchema]]` will prefetch `posts` whether or not a `resolve_posts` method exists — as long as `posts` is a real reverse-relation name on the Django model.
+
+If you name a resolver field differently from the ORM relation it reaches into — for example, a field `related_event` whose resolver does `obj.event` — the optimizer cannot infer the relationship and the request will N+1. You have two options:
+
+1. Match the field name to the ORM reverse name (cleanest; the optimizer just works).
+2. Pre-optimize the queryset in the view: `return Category.objects.prefetch_related("event")`. The fork's auto-optimization is skipped for unknown field names, so your manual call survives intact.
+
+Scalar resolver-backed `Includable` fields (e.g. `Includable[str]` whose value is computed) are always skipped by the optimizer — there's nothing to prefetch.
+
 ### OpenAPI documentation
 
 The OpenAPI document renders the **maximal** response schema (every `Includable` field is present and optional) and adds the two query parameters with descriptions listing the valid values. For example:

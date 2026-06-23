@@ -169,12 +169,18 @@ def _validate_input_against_meta(
                 }])
 
     # ---- Include validation ----
-    if config.strict_unknown and selector.includes:
-        bad = sorted(
-            ".".join(path) for path in selector.includes
-            if not _path_is_valid_include(path, schema, root_includable_names)
-        )
-        if bad:
+    # We always resolve aliases here, even when strict_unknown=False, so
+    # downstream code (build_include) sees canonical field names.
+    if selector.includes:
+        normalized: set = set()
+        bad: list = []
+        for path in selector.includes:
+            canonical = _canonicalize_include_path(path, schema, root_includable_names)
+            if canonical is None:
+                bad.append(".".join(path))
+            else:
+                normalized.add(canonical)
+        if bad and config.strict_unknown:
             allowed_paths = sorted(
                 ".".join(p) for p in _enumerate_includable_paths(schema)
             )
@@ -182,36 +188,47 @@ def _validate_input_against_meta(
                 "type": "value_error",
                 "loc": ("query", config.include_param),
                 "msg": (
-                    f"Unknown include value(s): {bad}. "
+                    f"Unknown include value(s): {sorted(bad)}. "
                     f"Available: {allowed_paths}."
                 ),
             }])
+        selector.includes = normalized
 
 
-def _path_is_valid_include(path, schema, root_overrides) -> bool:
+def _canonicalize_include_path(path, schema, root_overrides):
     """
-    A dot-path is valid if each segment names an Includable field on its
-    parent schema. The root segment may be overridden by an explicit
+    Walk a dot-path through the schema graph, accepting either field names
+    or aliases at each segment, and return the canonical field-name path.
+    Returns ``None`` if any segment doesn't name an Includable field on its
+    parent schema.
+
+    Root-segment validation can be overridden by an explicit
     ``includable=[...]`` decorator arg.
     """
-    from ninja.dynamic.selector import _resolve_field_schema
+    from ninja.dynamic.selector import _alias_to_name, _resolve_field_schema
 
     cur_schema = schema
+    canonical_segments: list = []
     for i, segment in enumerate(path):
         if cur_schema is None:
-            return False
+            return None
+        # Map alias → canonical field name at this level. Unknown segments
+        # pass through unchanged so the includable check below rejects them.
+        alias_map = _alias_to_name(cur_schema)
+        canonical = alias_map.get(segment, segment)
         meta = get_dynamic_meta(cur_schema)
         allowed = (
             root_overrides
             if i == 0 and root_overrides
             else (set(meta.includable) if meta else set())
         )
-        if segment not in allowed:
-            return False
-        if segment not in cur_schema.model_fields:
-            return False
-        cur_schema = _resolve_field_schema(cur_schema.model_fields[segment].annotation)
-    return True
+        if canonical not in allowed:
+            return None
+        if canonical not in cur_schema.model_fields:
+            return None
+        canonical_segments.append(canonical)
+        cur_schema = _resolve_field_schema(cur_schema.model_fields[canonical].annotation)
+    return tuple(canonical_segments)
 
 
 def _enumerate_includable_paths(schema):

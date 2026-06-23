@@ -1,8 +1,10 @@
-from typing import Any, List, Optional, Tuple, Type
+from typing import Any, List, Optional, Set, Tuple, Type
 
 from django.db.models import ForeignKey, Model, OneToOneField, QuerySet
+from django.db.models.query import prefetch_related_objects
+from django.http import HttpRequest
 
-from ninja.dynamic.selector import FieldSelector, _resolve_field_schema
+from ninja.dynamic.selector import FieldSelector
 from ninja.schema import Schema
 
 
@@ -26,8 +28,9 @@ def _orm_model_for(schema: Type[Schema]) -> Optional[Type[Model]]:
 def _classify_relation(model: Type[Model], orm_field_name: str) -> Optional[str]:
     """
     Return ``"select"`` for FK/O2O, ``"prefetch"`` for reverse / M2M, ``None``
-    if the field is unknown (caller should default to prefetch_related as the
-    safe fallback).
+    if the field does not exist on ``model`` (a resolver-backed or scalar
+    Includable). Callers must treat ``None`` as "not an ORM relation — skip
+    this path entirely", not as a fallback to prefetch.
     """
     try:
         field = model._meta.get_field(orm_field_name)
@@ -35,6 +38,11 @@ def _classify_relation(model: Type[Model], orm_field_name: str) -> Optional[str]
         return None
     if isinstance(field, (ForeignKey, OneToOneField)):
         return "select"
+    related = getattr(field, "related_model", None)
+    if related is None:
+        # Concrete scalar column (CharField, IntegerField, ...) — not a
+        # relation, can't be prefetched.
+        return None
     return "prefetch"
 
 
@@ -47,82 +55,161 @@ def _walk_paths(selector: FieldSelector) -> List[Tuple[str, ...]]:
     return sorted(selector.includes, key=len)
 
 
+def _compute_chains(
+    selector: FieldSelector, base_model: Type[Model]
+) -> Tuple[Set[str], Set[str]]:
+    """
+    Walk the selector's include paths against the base model and split each
+    into either a ``select_related`` chain or a ``prefetch_related`` chain.
+    Returns ``(select_chains, prefetch_chains)`` as deduped sets.
+    """
+    select_chains: Set[str] = set()
+    prefetch_chains: Set[str] = set()
+    for path in _walk_paths(selector):
+        prefix, kind = _longest_orm_prefix(path, base_model)
+        if not prefix:
+            continue
+        chain = "__".join(prefix)
+        if kind == "select":
+            select_chains.add(chain)
+        else:
+            prefetch_chains.add(chain)
+    return select_chains, prefetch_chains
+
+
 def apply_query_optimization(
     result: Any, selector: FieldSelector, schema: Type[Schema]
 ) -> Any:
     """
-    If ``result`` is a Django ``QuerySet`` (or ``Manager``) and ``schema`` is
-    backed by a Django model, attach ``select_related`` / ``prefetch_related``
-    for every relation the selector pulls in via ``?include=``. No-op for
-    plain values, dicts, or single model instances.
+    Attach ``select_related`` / ``prefetch_related`` (or call
+    ``prefetch_related_objects``) for every ``?include=`` path that resolves
+    to a real ORM relation chain on ``schema``'s underlying Django model.
+
+    Supported input shapes for ``result``:
+
+    * Django ``QuerySet`` — modified in place via ``select_related`` /
+      ``prefetch_related``; the optimized queryset is returned.
+    * Django ``Manager`` — ``result.all()`` is called to obtain a queryset,
+      then same as above.
+    * Single Django ``Model`` instance — ``prefetch_related_objects`` is
+      called on ``[result]`` so the relation cache is populated.
+    * Non-empty ``list`` of Django ``Model`` instances — same as above on
+      the whole list.
+
+    Anything else (dicts, plain values, generators, lists of dicts, lists
+    that mix types) is returned unchanged. Paths whose segments aren't ORM
+    relations are silently skipped — they're supplied at validation time
+    by a resolver or the view payload.
     """
     if not selector.includes:
-        return result
-
-    qs = result
-    manager_to_qs = getattr(qs, "all", None)
-    if callable(manager_to_qs):
-        try:
-            qs = manager_to_qs()
-        except Exception:
-            return result
-    if not isinstance(qs, QuerySet):
         return result
 
     base_model = _orm_model_for(schema)
     if base_model is None:
         return result
 
-    select_chains: List[str] = []
-    prefetch_chains: List[str] = []
+    select_chains, prefetch_chains = _compute_chains(selector, base_model)
+    if not select_chains and not prefetch_chains:
+        return result
 
-    for path in _walk_paths(selector):
-        kind = _classify_chain(path, schema, base_model)
-        chain = "__".join(path)
-        if kind == "select":
-            select_chains.append(chain)
-        else:
-            prefetch_chains.append(chain)
+    # Manager → QuerySet (e.g. ``Author.objects`` instead of ``Author.objects.all()``)
+    if (
+        not isinstance(result, (QuerySet, Model, list))
+        and callable(getattr(result, "all", None))
+    ):
+        try:
+            result = result.all()
+        except Exception:
+            return result
 
-    if select_chains:
-        qs = qs.select_related(*sorted(set(select_chains)))
-    if prefetch_chains:
-        qs = qs.prefetch_related(*sorted(set(prefetch_chains)))
-    return qs
+    if isinstance(result, QuerySet):
+        if select_chains:
+            result = result.select_related(*sorted(select_chains))
+        if prefetch_chains:
+            result = result.prefetch_related(*sorted(prefetch_chains))
+        return result
+
+    if isinstance(result, Model):
+        # Single instance — only optimize if it's the schema's model (a
+        # mismatched model can't have these relations).
+        if isinstance(result, base_model):
+            # ``prefetch_related_objects`` works for select-related chains
+            # too (it just doesn't JOIN); since the instance is already
+            # fetched we can't add a JOIN after the fact.
+            chains = sorted(select_chains | prefetch_chains)
+            if chains:
+                prefetch_related_objects([result], *chains)
+        return result
+
+    if (
+        isinstance(result, list)
+        and result
+        and all(isinstance(x, base_model) for x in result)
+    ):
+        chains = sorted(select_chains | prefetch_chains)
+        if chains:
+            prefetch_related_objects(result, *chains)
+        return result
+
+    return result
 
 
-def _classify_chain(
-    path: Tuple[str, ...], schema: Type[Schema], model: Type[Model]
-) -> str:
+def apply_pending_optimization(
+    request: HttpRequest, queryset: Any
+) -> Any:
     """
-    Classify the whole dot-path as ``"select"`` only if every hop is an
-    FK/O2O on its corresponding model; otherwise ``"prefetch"`` (safe choice
-    that also works for FK chains).
+    Apply queryset optimization deferred from a ``@dynamic_response``
+    decorator that wraps something else (e.g. ``@paginate``). Pagination
+    calls this after the wrapped view returns the raw queryset so that the
+    dynamic-schema ``?include=`` paths can attach
+    ``select_related`` / ``prefetch_related`` before pagination evaluates
+    the queryset.
+
+    No-op when no dynamic state is on the request or when ``?include=``
+    wasn't supplied.
+    """
+    selector = getattr(request, "_ninja_dynamic_selector", None)
+    schema = getattr(request, "_ninja_dynamic_response_schema", None)
+    if selector is None or schema is None or not selector.includes:
+        return queryset
+    return apply_query_optimization(queryset, selector, schema)
+
+
+def _longest_orm_prefix(
+    path: Tuple[str, ...], model: Type[Model]
+) -> Tuple[Tuple[str, ...], Optional[str]]:
+    """
+    Walk ``path`` against ``model``'s ORM metadata as far as every segment
+    is a real relation, and return ``(orm_prefix, kind)``:
+
+    * ``orm_prefix`` is the longest leading segment tuple that resolves to
+      real ORM relations. Empty if even the first segment is non-ORM.
+    * ``kind`` is ``"select"`` (every hop is FK/O2O), ``"prefetch"`` (at
+      least one reverse/M2M hop), or ``None`` (empty prefix).
+
+    The trailing segments past ``orm_prefix`` are assumed to be
+    resolver-backed or scalar fields — they need no ORM work, the
+    resolver supplies the value at validation time.
     """
     cur_model = model
-    cur_schema: Optional[Type[Schema]] = schema
     is_all_select = True
+    consumed: List[str] = []
 
     for hop in path:
         kind = _classify_relation(cur_model, hop)
+        if kind is None:
+            break
         if kind != "select":
             is_all_select = False
+        consumed.append(hop)
 
-        try:
-            next_field = cur_model._meta.get_field(hop)
-        except Exception:
-            break
+        next_field = cur_model._meta.get_field(hop)
         related = getattr(next_field, "related_model", None)
         if related is None:
-            break
+            # Shouldn't happen — _classify_relation already filtered scalars.
+            break  # pragma: no cover
         cur_model = related
 
-        if cur_schema is not None:
-            schema_field = cur_schema.model_fields.get(hop)
-            cur_schema = (
-                _resolve_field_schema(schema_field.annotation)
-                if schema_field is not None
-                else None
-            )
-
-    return "select" if is_all_select else "prefetch"
+    if not consumed:
+        return (), None
+    return tuple(consumed), "select" if is_all_select else "prefetch"

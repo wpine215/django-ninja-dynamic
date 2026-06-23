@@ -61,7 +61,12 @@ def _parse_flat(
 
     raw = _gather(query, config.fields_param)
     if raw is not None:
-        sel.sparse[None] = set(_split(raw, sep))
+        # ``?fields=`` (no values) or ``?fields=,,,`` is treated as if the
+        # parameter wasn't supplied — there's no use case for "return zero
+        # fields" and silently doing so would surprise users.
+        values = set(_split(raw, sep))
+        if values:
+            sel.sparse[None] = values
 
     # ``?include=`` accepts dot-paths in flat mode too. ``?include=posts``
     # opts the field in; ``?include=posts.author`` opts in and descends.
@@ -92,7 +97,11 @@ def _parse_jsonapi(
         raw = _gather(query, key)
         if raw is None:
             continue
-        sel.sparse.setdefault(resource, set()).update(_split(raw, sep))
+        values = set(_split(raw, sep))
+        if not values:
+            # Empty per-resource bucket — treat as if not supplied.
+            continue
+        sel.sparse.setdefault(resource, set()).update(values)
 
     # JSON:API ``include`` is dot-pathed: ``include=posts.author,comments``.
     raw = _gather(query, config.include_param)

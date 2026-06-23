@@ -631,6 +631,14 @@ def _inject_pagination(
                 status_code = items.status_code
                 items = items.value
 
+            # If an outer @dynamic_response decorator stashed selector +
+            # schema on the request, attach select_related / prefetch_related
+            # to the queryset before pagination evaluates it. No-op when
+            # the dynamic decorator isn't in the chain.
+            from ninja.dynamic.queryset import apply_pending_optimization
+
+            items = apply_pending_optimization(request, items)
+
             result = await paginator.apaginate_queryset(
                 items, pagination=pagination_params, request=request, **kwargs
             )
@@ -665,6 +673,14 @@ def _inject_pagination(
             if isinstance(items, Status):
                 status_code = items.status_code
                 items = items.value
+
+            # If an outer @dynamic_response decorator stashed selector +
+            # schema on the request, attach select_related / prefetch_related
+            # to the queryset before pagination evaluates it. No-op when
+            # the dynamic decorator isn't in the chain.
+            from ninja.dynamic.queryset import apply_pending_optimization
+
+            items = apply_pending_optimization(request, items)
 
             result = paginator.paginate_queryset(
                 items, pagination=pagination_params, request=request, **kwargs
