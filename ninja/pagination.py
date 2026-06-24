@@ -766,6 +766,11 @@ def make_response_paginated(paginator: PaginationBase, op: Operation) -> None:
         (paginator.Output,),
         {
             "__annotations__": {paginator.items_attribute: List[item_schema]},  # type: ignore
+            # Marker read by ``ninja.dynamic.schema.unwrap_response_annotation``
+            # so dynamic-schema unwrap targets this generated paginator wrapper
+            # specifically — not arbitrary user schemas that happen to have a
+            # single ``List[Inner]`` field (e.g. ``FeedSchema(id, posts)``).
+            "__ninja_paginated_items_attr__": paginator.items_attribute,
         },
     )  # typing: ignore
 

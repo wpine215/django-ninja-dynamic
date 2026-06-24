@@ -138,25 +138,23 @@ def unwrap_response_annotation(annotation: Any) -> "tuple[Type[Schema] | None, b
     ``(UserSchema, is_list)``. Returns ``(None, False)`` if there's no Schema
     underneath (e.g. a plain dict response).
 
-    Also looks one level inside a wrapper Schema that contains a single
-    ``List[InnerSchema]`` field — this is the shape pagination's
-    ``make_response_paginated`` produces (``Paged{Foo}.items``). Recognizing
-    it lets ``@dynamic_response`` capture the inner item schema regardless of
-    decorator stacking order.
+    Also unwraps the wrapper Schema that pagination's
+    ``make_response_paginated`` produces (``Paged{Foo}.<items_attr>``). The
+    wrapper is identified by the ``__ninja_paginated_items_attr__`` marker set
+    by ``make_response_paginated`` — *not* by a structural "one list field"
+    heuristic, which would false-positive on user schemas like
+    ``FeedSchema(id, posts: List[PostSchema])``.
     """
     from typing import get_args, get_origin
 
     if isinstance(annotation, type) and issubclass(annotation, Schema):
-        list_fields = []
-        for fname, fld in annotation.model_fields.items():
-            sub_ann = fld.annotation
+        items_attr = getattr(annotation, "__ninja_paginated_items_attr__", None)
+        if items_attr and items_attr in annotation.model_fields:
+            sub_ann = annotation.model_fields[items_attr].annotation
             if get_origin(sub_ann) is list:
                 args = get_args(sub_ann)
                 if args and isinstance(args[0], type) and issubclass(args[0], Schema):
-                    list_fields.append((fname, args[0]))
-        if len(list_fields) == 1:
-            _, inner = list_fields[0]
-            return inner, True
+                    return args[0], True
         return annotation, False
 
     origin = get_origin(annotation)

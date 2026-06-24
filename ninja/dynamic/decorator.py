@@ -199,60 +199,69 @@ def _canonicalize_include_path(path, schema, root_overrides):
     """
     Walk a dot-path through the schema graph, accepting either field names
     or aliases at each segment, and return the canonical field-name path.
-    Returns ``None`` if any segment doesn't name an Includable field on its
-    parent schema.
+    Returns ``None`` if the path is invalid.
 
-    Root-segment validation can be overridden by an explicit
-    ``includable=[...]`` decorator arg.
+    A path is valid when its **terminal** segment names an Includable field
+    on its parent schema. Intermediate segments may be either Includable
+    *or* default-visible fields that resolve to a nested Schema — i.e. you
+    can descend through a default-visible nested schema to reach an
+    Includable deeper in the graph (e.g. ``?include=group.organization``
+    where ``group`` is default-visible and ``organization`` is Includable
+    on ``GroupSchema``). This mirrors the dot-paths the OpenAPI walker
+    advertises in ``walk_schema_graph``.
+
+    Root-segment validation against ``root_overrides`` (an explicit
+    ``includable=[...]`` decorator arg) is enforced only when the root is
+    *also* the terminal segment; intermediate root segments still get the
+    default-visible escape hatch so a single-segment override list doesn't
+    foreclose deeper paths through non-Includable fields.
     """
     from ninja.dynamic.selector import _alias_to_name, _resolve_field_schema
 
     cur_schema = schema
     canonical_segments: list = []
+    n = len(path)
     for i, segment in enumerate(path):
         if cur_schema is None:
             return None
         # Map alias → canonical field name at this level. Unknown segments
-        # pass through unchanged so the includable check below rejects them.
+        # pass through unchanged so the field-existence check below rejects them.
         alias_map = _alias_to_name(cur_schema)
         canonical = alias_map.get(segment, segment)
+        if canonical not in cur_schema.model_fields:
+            return None
         meta = get_dynamic_meta(cur_schema)
         allowed = (
             root_overrides
             if i == 0 and root_overrides
             else (set(meta.includable) if meta else set())
         )
+        is_terminal = i == n - 1
         if canonical not in allowed:
-            return None
-        if canonical not in cur_schema.model_fields:
-            return None
+            if is_terminal:
+                return None
+            # Intermediate hop through a default-visible field is allowed
+            # only when it resolves to a nested schema we can descend into.
+            nested = _resolve_field_schema(
+                cur_schema.model_fields[canonical].annotation
+            )
+            if nested is None:
+                return None
         canonical_segments.append(canonical)
         cur_schema = _resolve_field_schema(cur_schema.model_fields[canonical].annotation)
     return tuple(canonical_segments)
 
 
 def _enumerate_includable_paths(schema):
-    """All dot-paths reachable from ``schema`` whose segments are Includable."""
-    from ninja.dynamic.selector import _resolve_field_schema
-
-    out = set()
-
-    def walk(current, prefix=()):
-        meta = get_dynamic_meta(current)
-        if not meta:
-            return
-        for name in meta.includable:
-            path = prefix + (name,)
-            out.add(path)
-            fld = current.model_fields.get(name)
-            if fld is None:
-                continue
-            nested = _resolve_field_schema(fld.annotation)
-            if nested is not None:
-                walk(nested, path)
-
-    walk(schema)
-    return out
+    """
+    All dot-paths a user may pass to ``?include=``: those whose **terminal**
+    segment names an Includable field on its parent schema. Intermediate
+    segments may be either Includable or default-visible fields that resolve
+    to a nested schema (mirroring ``_canonicalize_include_path``). Delegates
+    to ``walk_schema_graph`` so the error message and the OpenAPI doc agree.
+    """
+    _, _, paths = walk_schema_graph(schema)
+    return paths
 
 
 _VIEW_STATE_ATTR = "_ninja_dynamic_state"
