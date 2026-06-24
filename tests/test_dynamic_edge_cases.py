@@ -216,6 +216,243 @@ class TestPlainSchemaInsideDynamicSchema:
         assert body["opt_plain"] == {"x": 2, "y": "b"}
 
 
+class TestIncludeThroughDefaultVisibleNestedSchema:
+    """
+    Dot-paths in ``?include=`` may traverse a default-visible nested
+    ``DynamicSchema`` to reach an ``Includable`` deeper in the graph. The
+    OpenAPI walker has always advertised these paths; the runtime validator
+    now agrees.
+    """
+
+    def _build_api(self, namespace):
+        class OrganizationSchema(DynamicSchema):
+            id: int
+            name: str
+
+        class GroupSchema(DynamicSchema):
+            id: int
+            label: str
+            organization: Includable[OrganizationSchema]
+
+        class UserSchema(DynamicSchema):
+            id: int
+            name: str
+            group: GroupSchema  # default-visible
+
+        api = NinjaAPI(urls_namespace=namespace)
+
+        @api.get("/u", response=UserSchema)
+        @dynamic_response
+        def gu(request):
+            return {
+                "id": 1,
+                "name": "alice",
+                "group": {
+                    "id": 7,
+                    "label": "admins",
+                    "organization": {"id": 99, "name": "Acme"},
+                },
+            }
+
+        return api, UserSchema, GroupSchema, OrganizationSchema
+
+    def test_include_through_default_nested_returns_field(self):
+        api, *_ = self._build_api("ec-nest-default-ok")
+        c = TestClient(api)
+
+        # Default: group is visible, organization is hidden.
+        body = c.get("/u").json()
+        assert body == {
+            "id": 1,
+            "name": "alice",
+            "group": {"id": 7, "label": "admins"},
+        }
+
+        # ?include=group.organization opts in the deeper Includable.
+        body = c.get("/u?include=group.organization").json()
+        assert body == {
+            "id": 1,
+            "name": "alice",
+            "group": {
+                "id": 7,
+                "label": "admins",
+                "organization": {"id": 99, "name": "Acme"},
+            },
+        }
+
+    def test_openapi_and_validator_agree_on_dot_path(self):
+        api, *_ = self._build_api("ec-nest-default-docs")
+        sch = api.get_openapi_schema(path_prefix="/api/")
+        params = sch["paths"]["/api/u"]["get"]["parameters"]
+        include_param = next(p for p in params if p["name"] == "include")
+        # OpenAPI advertises the deep path.
+        assert "group.organization" in include_param["description"]
+        # Validator accepts the same path (no 422).
+        c = TestClient(api)
+        resp = c.get("/u?include=group.organization")
+        assert resp.status_code == 200, resp.json()
+
+    def test_single_segment_default_field_still_rejected(self):
+        # Asking to include a default-visible field by name is still 422 —
+        # OpenAPI doesn't advertise it, and it would be a no-op anyway.
+        api, *_ = self._build_api("ec-nest-default-bare")
+        c = TestClient(api)
+        resp = c.get("/u?include=group")
+        assert resp.status_code == 422
+
+    def test_unknown_terminal_still_rejected(self):
+        # An invalid terminal segment after a valid traversal still 422s.
+        api, *_ = self._build_api("ec-nest-default-bad-terminal")
+        c = TestClient(api)
+        resp = c.get("/u?include=group.does_not_exist")
+        assert resp.status_code == 422
+
+    def test_default_segment_not_a_schema_rejected(self):
+        # Default-visible intermediate must resolve to a nested schema.
+        class S(DynamicSchema):
+            id: int
+            name: str  # scalar default-visible
+
+        api = NinjaAPI(urls_namespace="ec-nest-default-scalar")
+
+        @api.get("/s", response=S)
+        @dynamic_response
+        def gs(request):
+            return {"id": 1, "name": "x"}
+
+        c = TestClient(api)
+        # "name" is default-visible scalar — can't be traversed.
+        resp = c.get("/s?include=name.something")
+        assert resp.status_code == 422
+
+    def test_list_typed_default_intermediate(self):
+        """
+        ``?include=posts.author`` where ``posts: List[PostSchema]`` is
+        default-visible. Regression test for two bugs: (a) the validator
+        rejecting list-typed intermediates pre-fix, (b) the pagination
+        heuristic in ``unwrap_response_annotation`` mis-identifying any
+        schema with one ``List[Inner]`` field as a paginator wrapper.
+        """
+        class AuthorSchema(DynamicSchema):
+            id: int
+            bio: Includable[str]
+
+        class PostSchema(DynamicSchema):
+            id: int
+            title: str
+            author: Includable[AuthorSchema]
+
+        class FeedSchema(DynamicSchema):
+            id: int
+            posts: List[PostSchema]
+
+        api = NinjaAPI(urls_namespace="ec-list-default-intermediate")
+
+        @api.get("/f", response=FeedSchema)
+        @dynamic_response
+        def gf(request):
+            return {
+                "id": 1,
+                "posts": [
+                    {"id": 1, "title": "p1", "author": {"id": 1, "bio": "bio1"}},
+                    {"id": 2, "title": "p2", "author": {"id": 2, "bio": "bio2"}},
+                ],
+            }
+
+        c = TestClient(api)
+        body = c.get("/f").json()
+        # Default: posts present, author hidden (Includable) on each.
+        assert body == {
+            "id": 1,
+            "posts": [
+                {"id": 1, "title": "p1"},
+                {"id": 2, "title": "p2"},
+            ],
+        }
+        body = c.get("/f?include=posts.author").json()
+        assert all("author" in p for p in body["posts"])
+        assert body["posts"][0]["author"] == {"id": 1}
+
+    def test_sparse_at_root_does_not_swallow_deep_include(self):
+        """
+        ``?fields=name&include=group.organization``: sparse limits root to
+        ``name``, but the dot-path traversal through ``group`` must still
+        be honored, otherwise the include is silently dropped.
+        """
+        class OrgSchema(DynamicSchema):
+            id: int
+            name: str
+
+        class GroupSchema(DynamicSchema):
+            id: int
+            label: str
+            organization: Includable[OrgSchema]
+
+        class UserSchema(DynamicSchema):
+            id: int
+            name: str
+            group: GroupSchema
+
+        api = NinjaAPI(urls_namespace="ec-sparse-deep-include")
+
+        @api.get("/u", response=UserSchema)
+        @dynamic_response
+        def gu(request):
+            return {
+                "id": 1,
+                "name": "alice",
+                "group": {"id": 7, "label": "L", "organization": {"id": 99, "name": "Acme"}},
+            }
+
+        c = TestClient(api)
+        body = c.get("/u?fields=name&include=group.organization").json()
+        # sparse keeps only "name" of the root defaults, BUT the include
+        # path forces ``group`` to be retained for the traversal — with
+        # only its own includable opted in.
+        assert body == {
+            "name": "alice",
+            "group": {"id": 7, "label": "L", "organization": {"id": 99, "name": "Acme"}},
+        }
+
+    def test_cycle_does_not_recurse_infinitely(self):
+        """
+        Two-schema cycle A→B→A where both have Includables. With no
+        deep user path, the include-spec builder must terminate the
+        cycle rather than recurse forever.
+        """
+        class A2(DynamicSchema):
+            id: int
+            x: Includable[int]
+            b: Optional["B2"] = None
+
+        class B2(DynamicSchema):
+            id: int
+            a: Optional[A2] = None  # default
+            y: Includable[int]
+
+        A2.model_rebuild()
+        B2.model_rebuild()
+
+        api = NinjaAPI(urls_namespace="ec-cycle-terminates")
+
+        @api.get("/a", response=A2)
+        @dynamic_response
+        def ga(request):
+            return {
+                "id": 1, "x": 10,
+                "b": {"id": 2, "a": {"id": 3, "x": 30, "b": None}, "y": 99},
+            }
+
+        c = TestClient(api)
+        # Default: x and y hidden everywhere.
+        body = c.get("/a").json()
+        assert "x" not in body
+        assert "y" not in body["b"]
+        # ``?include=b.a.x`` walks the cycle once. No RecursionError.
+        body = c.get("/a?include=b.a.x").json()
+        assert body["b"]["a"]["x"] == 30
+
+
 class TestMultiLevelInheritance:
     def test_grandparent_includables_inherit(self):
         class GP(DynamicSchema):

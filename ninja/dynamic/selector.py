@@ -278,6 +278,7 @@ def _build_include_inner(
     selector: FieldSelector,
     schema: Type[Schema],
     parent_path: Tuple[str, ...] = (),
+    _visited: Tuple[Type[Schema], ...] = (),
 ) -> Optional[Dict[str, Any]]:
     """
     Compute the per-schema Pydantic include spec for one nesting level,
@@ -301,6 +302,14 @@ def _build_include_inner(
     all_field_names = set(schema.model_fields.keys())
     plain_fields = all_field_names - includable
 
+    # Cycle guard: if we've already descended through ``schema`` higher up
+    # the stack AND no further user-supplied dot-path goes through this
+    # point, terminate with a one-level spec that includes only the
+    # default-visible fields (so ``Includable`` fields at the cycle
+    # boundary still get filtered out, but we don't recurse forever).
+    if schema in _visited and not selector.has_deeper_path_through(parent_path):
+        return {name: True for name in plain_fields}
+
     fields_set = selector.fields_for(schema, is_root=is_root)
     if fields_set is not None:
         fields_set = _normalize_to_field_names(fields_set, schema)
@@ -309,9 +318,21 @@ def _build_include_inner(
     requested_at_this_level = selector.child_paths_at(parent_path)
     requested_includables_here = requested_at_this_level & includable
 
+    # Default-visible plain fields that aren't in the sparse allowlist but
+    # have an ``?include=`` dot-path going through them must still be kept,
+    # otherwise sparse silently swallows the include (e.g. ``?fields=name
+    # &include=group.organization`` would drop ``group`` and never reach
+    # ``organization``).
+    default_with_deeper_path: Set[str] = {
+        name for name in (requested_at_this_level & plain_fields)
+        if selector.has_deeper_path_through(parent_path + (name,))
+    }
+
     if has_sparse:
         sparse_plain = fields_set & plain_fields
-        effective: Set[str] = sparse_plain | requested_includables_here
+        effective: Set[str] = (
+            sparse_plain | requested_includables_here | default_with_deeper_path
+        )
     else:
         effective = plain_fields | requested_includables_here
 
@@ -347,7 +368,10 @@ def _build_include_inner(
         nested_schema = _resolve_field_schema(schema.model_fields[fname].annotation)
         nested_is_list = _is_list_annotation(schema.model_fields[fname].annotation)
         nested_inner = _build_include_inner(
-            selector, nested_schema, parent_path=parent_path + (fname,)
+            selector,
+            nested_schema,
+            parent_path=parent_path + (fname,),
+            _visited=_visited + (schema,),
         )
         if nested_inner is None:
             inner[fname] = True
